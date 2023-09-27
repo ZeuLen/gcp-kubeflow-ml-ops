@@ -1,0 +1,7 @@
+google-api-python-client
+google-cloud-scheduler
+google-cloud-storage
+google-cloud-bigquery
+google-cloud-logging
+google-cloud-aiplatform
+google-cloud-aiplatform[pipelines]

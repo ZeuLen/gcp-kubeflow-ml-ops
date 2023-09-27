@@ -1,0 +1,238 @@
+timeout: 1200s
+steps:
+  - id: 'check branch naming'
+    name: 'alpine'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        developer_project_number=$(echo $BRANCH_NAME | rev | cut -d '-' -f1 | rev)
+        if ! [[ "$developer_project_number" =~ ^[1-9]?[0-9] ]]
+            then
+                echo "Please provide a developer project number at the end of the feature branch name, delimited by a minus:"
+                echo "e.g.: feature-branch-name-5"
+                echo "You provided: ${developer_project_number}. Project number must be between 1 and 99."
+                echo "Abort build."
+                exit 1
+            else
+                echo "Developer project number according to branch name: ${developer_project_number}."
+        fi
+  
+
+  # Prepare to access GAM modelling repo by getting the ssh key from the secret manager and adding to known hosts
+  - id: Prepare Github Access
+    name: 'gcr.io/cloud-builders/git'
+    secretEnv: [ 'SSH_KEY' ]
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        echo "$$SSH_KEY" >> /root/.ssh/id_rsa
+        chmod 400 /root/.ssh/id_rsa
+        ssh-keyscan -t rsa github.com >> /root/.ssh/known_hosts
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
+
+
+  # Clone the GAM modeling repository
+  - id: 'git clone'
+    name: 'gcr.io/cloud-builders/git'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        if [[ ${BRANCH_NAME} = release* ]]
+        then
+          echo "No action is taken for release branches. They are only there for staging the release."
+        else
+          git clone git@github.com:rewe-digital-misc/RetailMedia-Modelling-GAM.git
+          ls -a
+          cd RetailMedia-Modelling-GAM
+          ls -a
+        fi
+
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
+
+#     Build the docker base image for Kubeflow Pipelines
+  - id: 'Build Docker Base Image'
+    name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - "-c"
+      - "-e"
+      - |
+        image_name="kubeflow-base-image"
+        registry_url="gcr.io/cdp-developers-${BRANCH_NAME}/retailmedia-modeling"
+
+        cd RetailMedia-Modelling-GAM/local_packages
+        docker build -t ${image_name} .
+        docker tag ${image_name} ${registry_url}/${image_name}
+        docker push ${registry_url}/${image_name}
+
+
+
+  - id: 'Parse Pipeline Config'
+    name: 'python:3.9'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        pip install -r requirements.txt
+        pipeline_config="RetailMedia-Modelling-GAM/pipelines/pipeline_config.yaml"
+        python parse_pipeline_config.py --path=$pipeline_config
+
+
+  - id: 'Vertex AI Pipeline Compilation'
+    name: 'python:3.9'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        #!/bin/bash
+
+        wget https://github.com/mikefarah/yq/releases/download/v4.13.4/yq_linux_amd64 -O /usr/local/bin/yq
+        chmod +x /usr/local/bin/yq
+        pip install notebook
+        
+        yaml_file="RetailMedia-Modelling-GAM/pipelines/pipeline_config.yaml"
+        pipeline_output_bucket="gs://$BRANCH_NAME-vertex-model-pipeline-artefacts/"
+        
+        # Check if file exists
+        if [[ ! -f "$yaml_file" ]]; then
+          echo "YAML file not found!"
+          exit 1
+        fi
+        
+        # Get the number of pipelines
+        num_pipelines=$(yq e '.pipelines | length' "$yaml_file")
+        
+        # Check if num_pipelines is a number
+        if ! [[ "$num_pipelines" =~ ^[0-9]+$ ]]; then
+          echo "Error: Number of pipelines is not a number."
+          exit 1
+        fi
+        
+        # create directory for pipeline output
+        directory_name="pipeline_output"
+        if [ ! -d "$directory_name" ]; then
+            mkdir "$directory_name"
+            echo "Directory '$directory_name' created."
+        else
+            echo "Directory '$directory_name' already exists."
+        fi
+        
+        name_concat=""
+        output_file_concat=""
+        schedule_concat=""
+        
+        # Loop through each pipeline
+        for (( i=0; i<$num_pipelines; i++ )); do
+          name=$(yq e ".pipelines[$i].name" "$yaml_file")
+          root_path=$(yq e ".pipelines[$i].root_path" "$yaml_file")
+          module_file_name=$(yq e ".pipelines[$i].module_file_name" "$yaml_file")
+          module_dependencies=$(yq e ".pipelines[$i].module_dependencies" "$yaml_file")
+          pipeline_output=$(yq e ".pipelines[$i].pipeline_output" "$yaml_file")
+          pipeline_arguments=$(yq e ".pipelines[$i].pipeline_arguments" "$yaml_file")
+          requirements_path="$root_path$module_dependencies"
+          pipeline_path="$root_path$module_file_name"
+          output_path="pipeline_output/$pipeline_output"
+          pipeline_arguments_path="$root_path$pipeline_arguments"
+          schedule="$(yq e ".pipelines[$i].schedule" "$yaml_file")"
+          
+          echo "Pipeline $((i+1)):"
+          echo "  name: $name"
+          echo "  root_path: $root_path"
+          echo "  module_file_name: $module_file_name"
+          echo "  module_dependencies: $module_dependencies"
+          echo "  pipeline_output: $pipeline_output"
+          echo "  requirements_path: $requirements_path"
+          echo "  pipeline_path: $pipeline_path"
+          echo "  output_path: $output_path"
+          echo "  pipeline_arguments: $pipeline_arguments"
+          echo "  pipeline_arguments_path: $pipeline_arguments_path"
+          echo "  schedule: $schedule"
+        
+          name_concat="${name_concat},${name}"
+          output_file_concat="${output_file_concat},${pipeline_output_bucket}${pipeline_output}"
+          schedule_concat="${schedule_concat},${schedule}"
+        
+          pip install -r "$requirements_path"
+        
+          if [ "${module_file_name: -3}" == ".py" ]; then
+              # compile .py module
+              python "$pipeline_path" --path="$output_path"
+          else
+              # compile .ipynb module
+              papermill "$pipeline_path" "$output_path" -f "$pipeline_arguments_path"
+          fi
+        
+        done
+        
+        echo "${name_concat/,/}"
+        echo "${output_file_concat/,/}"
+        echo "${schedule_concat/,/}"
+        
+        echo "${name_concat/,/}"> /workspace/name_concat.txt
+        echo "${output_file_concat/,/}" > /workspace/output_file_concat.txt
+        echo "${schedule_concat/,/}" > /workspace/schedule_concat.txt
+
+
+  - id: 'tf init'
+    name: 'hashicorp/terraform:1.4.6'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        developer_project_number=$(echo $BRANCH_NAME | rev | cut -d '-' -f1 | rev)
+        cd "main/"
+        terraform init -backend-config="prefix=env/developer-${developer_project_number}"
+
+
+  - id: 'tf apply'
+    name: 'hashicorp/terraform:1.4.6'
+    entrypoint: 'sh'
+    args:
+      - '-c'
+      - |
+        # fix env name to include protected
+        pipeline_path="gs://vertex-model-pipeline-artefacts"
+        developer_project_number=$(echo $BRANCH_NAME | rev | cut -d '-' -f1 | rev)
+        
+        name_concat=$(cat /workspace/name_concat.txt)
+        output_file_concat=$(cat /workspace/output_file_concat.txt)
+        schedule_concat=$(cat /workspace/schedule_concat.txt)
+        
+        echo "name_concat: ${name_concat}"
+        echo "output_file_concat: ${output_file_concat}"
+        echo "schedule_concat: ${schedule_concat}"
+                  
+        cd "main/"
+          terraform apply -input=false -auto-approve \
+          -var "env=developer-${developer_project_number}" \
+          -var "project=cdp-developers-developer-${developer_project_number}" \
+          -var "pipeline_path=${output_file_concat}" \
+          -var "pipeline_name=${name_concat}" \
+          -var "schedule=${schedule_concat}" \
+          -var-file ./tfvars/shared.tfvars \
+          -var-file ./tfvars/developer.tfvars
+
+  - id: 'Push to GCS'
+    name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # check if the pipeline output directory is empty or not
+        if [ -n "$(ls -A pipeline_output/)" ]; then
+          gsutil -m cp -r pipeline_output/* 'gs://$BRANCH_NAME-vertex-model-pipeline-artefacts/'
+        else
+          echo "pipeline_output directory is empty."
+        fi
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/cdp-deployment-infrastructure/secrets/GAM_modeling_repo_key/versions/latest
+      env: 'SSH_KEY'

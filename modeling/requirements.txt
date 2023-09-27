@@ -1,0 +1,6 @@
+urllib3==1.26.15
+requests==2.29.0
+kfp==1.8.20
+google-cloud-aiplatform==1.24.1
+google-cloud-pipeline-components==1.0.42
+papermill
