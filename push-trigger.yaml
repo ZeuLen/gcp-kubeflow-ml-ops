@@ -56,9 +56,9 @@ steps:
       - name: 'ssh'
         path: /root/.ssh
 
-#     Build the docker base image for Kubeflow Pipelines
+#     Build the base_image base image for Kubeflow Pipelines
   - id: 'Build Docker Base Image'
-    name: 'gcr.io/cloud-builders/docker'
+    name: 'gcr.io/cloud-builders/base_image'
     entrypoint: 'bash'
     args:
       - "-c"
