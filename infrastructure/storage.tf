@@ -118,3 +118,14 @@ resource "google_storage_bucket_object" "rm_upload_static_files" {
     command = "echo Uploading ${each.value}"
   }
 }
+
+resource "google_storage_bucket_object" "training_data_bucket" {
+  for_each = fileset("CustomerCloud-Modeling-Inf-GAM/RetailMedia-Modelling-GAM/static/", "*")
+  name     = each.value
+  bucket   = google_storage_bucket.rm_static_files.name
+  source   = "CustomerCloud-Modeling-Inf-GAM/RetailMedia-Modelling-GAM/static/${each.value}"
+
+  provisioner "local-exec" {
+    command = "echo Uploading ${each.value}"
+  }
+}
