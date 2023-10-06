@@ -1,6 +1,3 @@
-def fetch_model():
-
-
 def prediction(model):
 
     predictions = model.predict(X_test)
